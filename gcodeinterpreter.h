@@ -45,7 +45,13 @@ class GCodeInterpreter : public QThread
 private:
     Q_OBJECT
 
-    MotorController _Controller;
+    enum ArcDirection
+    {
+        CLOCKWISE = 2,
+        CTRCLOCKWISE = 3
+    };
+
+    MotorController *_Controller;
 
     //GCODE entries
     QStringList _GCODE;
@@ -57,8 +63,6 @@ private:
 
     //Define Stepper Motors.
     StepperMotor *_XAxis, *_YAxis, *_ZAxis, *_ExtAxis;
-
-    //EndStop *_XStop, *_YStop, *_ZStop; //May do something fancy with end stops someday.
 
     ThermalProbe *_BedProbe, *_ExtProbe;
     //Need a pointer so we can share this resource with the probes.
@@ -82,7 +86,7 @@ private:
 
     void InitializeMotors();
     void InitializeThermalProbes();
-    void InitializeEndStops();
+    void InitializePrintArea();
     void InitializeADCConverter();
 
     void WriteToLogFile(const QString &);
@@ -92,6 +96,7 @@ private:
     QList<Coordinate>  GetCoordValues(QString &GString);
 
     void MoveToolHead(const float &XPosition, const float &YPosition, const float &ZPosition, const float &ExtPosition);
+    void ExecuteArcMove(const float &XPosition, const float &YPosition, const float &ZPosition, const float &ExtPosition, const float &IValue, const float &JValue, ArcDirection Direction);
 
 protected:
     void run();
@@ -163,6 +168,8 @@ public slots:
 
     void ChangeExtTemp(const int &Celsius);
 
+    void UpdatePositionLabel(QString Name, const long Pos);
+
 signals:
     void PrintStarted();
 
@@ -188,11 +195,13 @@ signals:
 	
     void TemperatureLow(int);
 
-    void OnError(QString);
+    void OnError(QString Val1, QString Val2 = "");
 
     void OnSuccess();
 	
     void ReportProgress(int);
+
+    void ReportMotorPosition(QString Name, const long Pos);
 };
 
 #endif // GCODEINTERPRETER_H

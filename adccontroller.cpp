@@ -58,6 +58,7 @@ int ADCController::GetChannelAverage(const unsigned int &Channel, const int &Rea
     int average =0;
     for(int i = 0; i < Reads; i++)
         average += GetChannelValue(Channel);
+    //TODO: Throw out values too far away from the mean values.
     return average / Reads;
 }
 
@@ -68,7 +69,7 @@ int ADCController::GetChannelValue(const unsigned int &Channel)
         return -1;
 
    /*
-   MCP3004/8 10-bit ADC 4/8 ch_Clockannels
+   MCP3004/8 10-bit ADC 4/8 channels
 
    1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17
    SB SD D2 D1 D0 NA NA B9 B8 B7 B6, B5 B4 B3 B2 B1 B0
@@ -103,7 +104,7 @@ int ADCController::GetChannelValue(const unsigned int &Channel)
         TX <<= 1;
         //bounce the clock and start again...
         gpioWrite(_Clock, PI_HIGH);
-        gpioDelay(5000);
+        gpioDelay(200);
         gpioWrite(_Clock, PI_LOW);
     }
 
@@ -111,7 +112,7 @@ int ADCController::GetChannelValue(const unsigned int &Channel)
     for(int i = 0; i < 12; i++)
     {
         gpioWrite(_Clock, PI_HIGH);
-        gpioDelay(5000);
+        gpioDelay(200);
         gpioWrite(_Clock, PI_LOW);
         RX <<= 1; //Shift our bit over so when we read the MISO we can OR the value with RX.
         if(gpioRead(_MISO))
