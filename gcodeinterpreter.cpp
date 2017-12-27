@@ -22,6 +22,7 @@
 #include "steppermotor.h"
 #include "motorcontroller.h"
 #include <QMessageBox>
+#include <QDebug>
 
 GCodeInterpreter::GCodeInterpreter(const QString &FilePath, QObject *parent)
     :QThread(parent)
@@ -45,12 +46,15 @@ GCodeInterpreter::GCodeInterpreter(const QString &FilePath, QObject *parent)
     _ZRes = 0;
 
     _SpeedFactor = .15;
+    _SpeedActual = .15;
+    _SpeedModulator = 1;
 
     _IsPrinting = false;
     _Stop = false;
     _TerminateThread = false;
 
     InitializeMotors();
+    InitializeFans();
     InitializePrintArea();
     InitializeThermalProbes();
     LoadGCode(FilePath);
@@ -66,8 +70,8 @@ GCodeInterpreter::~GCodeInterpreter()
     delete _BedProbe;
     delete _Controller;
 
-    BedProbeWorker->Terminate();
-    ExtProbeWorker->Terminate();
+    BedProbeWorker->Stop();
+    ExtProbeWorker->Stop();
     ExtProbeWorker->wait();
     BedProbeWorker->wait();
     delete BedProbeWorker;
@@ -86,22 +90,23 @@ void GCodeInterpreter::LoadGCode(const QString &FilePath)
     QFile PrintFile(FilePath);
     if(PrintFile.open(QIODevice::ReadOnly | QIODevice::Text ))
     {
+        QTime EstTime(0, 0, 0);
+
+        float lastX = 0, lastY = 0, lastZ = 0, speedfactor = 0;
+
         QTextStream Stream(&PrintFile);
         while (!Stream.atEnd())
         {
-            //float LastX = 0, lastY = 0;
-            //long TotalMS = 0;
-
             QString Line = Stream.readLine();
             if(!Line.startsWith(";") && !Line.isEmpty())//Weed out the comment lines and empties.
             {
-                _GCODE << Line.split(";")[0];//Again weed out any comments, we want just raw GCODE.
-
+                Line = Line.split(";")[0];//Again weed out any comments, we want just raw GCODE.
+                _GCODE << Line;
                 //Validate the GCODE and make sure the print isn't too big to fit on the bed.
-                if (Line.split(" ")[0].toUpper().startsWith("G") && !IsTooBig)
+                if (Line.split(" ")[0].toUpper().startsWith("G1"))
                 {
-                    QList<Coordinate> Coords = GetCoordValues(Line);
-                    float XVal = 0, YVal = 0;
+                    QList<Coordinate> Coords = GetCoordValues(Line.split(";")[0]);
+                    float XVal = 0, YVal = 0, ZVal = 0;
                     for(int i =0; i < Coords.length(); i++)
                     {
                         if(Coords[i].Name == "XAxis")
@@ -109,14 +114,62 @@ void GCodeInterpreter::LoadGCode(const QString &FilePath)
                         if(Coords[i].Name == "YAxis")
                             YVal = Coords[i].value;
                         if(Coords[i].Name == "ZAxis")
+                        {
+                            ZVal = Coords[i].value;
                             _Layers.append(_GCODE.length() - 1);//GCODE Line indexes for layers.
+                        }
                     }
                     if(XVal > _XArea || YVal > _YArea)
                         IsTooBig = true;
+
+                    //Caluclate the Time for this move and add the milliseconds to the EstTime so we can report it to the main ui
+                    QStringList GVals = Line.split(" ");
+
+                    for(int i = 0; i < GVals.length(); i++)
+                       if(GVals[i].contains("F") && !GVals[i].mid(1).isEmpty())
+                            speedfactor =  GVals[i].mid(1).toFloat() / 60000;
+                    if(Line.contains("X")  || Line.contains("Y") || Line.contains("Z"))
+                    {
+                        float stepX = 0, stepY = 0, stepZ = 0, rawX = 0, rawY = 0, rawZ = 0;
+                        if(XVal != 0)
+                        {
+                            rawX = qFloor((XVal/_XRes) + 0.5); //this is how I round.
+                            stepX = rawX - lastX;
+                            lastX = rawX;
+                        }
+                        if(YVal != 0)
+                        {
+                            rawY = qFloor((YVal/_YRes) + 0.5);
+                            stepY = rawY - lastY;
+                            lastY = rawY;
+                        }
+                        if(ZVal != 0)
+                        {
+                            rawZ = qFloor((ZVal/_ZRes) + 0.5);
+                            stepZ = rawZ - lastZ;
+                            lastZ = rawZ;
+                        }
+
+                        float hyp = qSqrt((qPow(stepX, 2) + qPow(stepY, 2)));
+                        //TODO: Add the 3d Hyp calculation for 3d moves.
+                        // float hyp3d = 0;
+                        //if(hyp > 0 && stepZ > 0)
+                        //hyp3d = qSqrt(qPow(hyp, 2) + qPow(stepZ, 2));
+
+                        //Total Rate of Travel
+                        float MSDelay = (1 / (speedfactor / qMax(_XRes, qMax(_YRes, _ZRes))));
+                        float DelayDelta = hyp / (stepX + stepY);
+
+                        float Delay = MSDelay / DelayDelta;
+                        Delay = qMax((float)(_XAxis->MaxSpeed() * .001), qMax((float)(_YAxis->MaxSpeed() * .001), Delay));
+                         //max of the triad is the actual max steps we will delay against.
+                        EstTime = EstTime.addMSecs(qMax(qMax(qAbs(stepX), qAbs(stepY)), qAbs(stepZ)) * Delay);
+                    }
                 }
             }
         }
         PrintFile.close();
+        EstimatedTime.append(EstTime.toString());
         if(IsTooBig)
             emit OnError("This print has a print area that is larger than the print area defined in the settings!");
     }
@@ -201,14 +254,14 @@ void GCodeInterpreter::InitializeThermalProbes()
                     _ExtProbe = new ThermalProbe(Params[1].toDouble(), Params[2].toInt(), Params[3].toInt(), Params[4].toInt(),
                             Params[5].toDouble(), Params[6].toInt(),  Params[7].toInt(), _ADCController);
                     ExtProbeWorker = new ProbeWorker(_ExtProbe, Params[8].toInt(), this);
-                    connect(this, SIGNAL(terminated()), ExtProbeWorker, SLOT(terminate()));
+                    //connect(this, SIGNAL(terminated()), ExtProbeWorker, SLOT(terminate()));
                 }
                 if(Params[0].contains("Bed"))
                 {
                     _BedProbe = new ThermalProbe(Params[1].toDouble(), Params[2].toInt(), Params[3].toInt(), Params[4].toInt(),
                             Params[5].toDouble(), Params[6].toInt(),  Params[7].toInt(), _ADCController);
                     BedProbeWorker = new ProbeWorker(_BedProbe, Params[8].toInt(), this);
-                    connect(this, SIGNAL(terminated()), BedProbeWorker, SLOT(terminate()));
+                   // connect(this, SIGNAL(terminated()), BedProbeWorker, SLOT(terminate()));
                 }
             }
         }
@@ -294,13 +347,18 @@ void GCodeInterpreter::InitializeMotors()
     }
 }
 
+void GCodeInterpreter::InitializeFans()
+{
+
+}
+
 void GCodeInterpreter::HomeAllAxis()
 {
     bool Done;
     if(_XAxis->IsAgainstStop() || _YAxis->IsAgainstStop() || _ZAxis->IsAgainstStop() || _ExtAxis->IsAgainstStop())
     {
+         this->TerminatePrint();
         QMessageBox::critical(0, "Ambigious End Stop Detected!", "An end stop on one of the axis is triggered and PiRinter3D cannot determine which one it is. Please check the machine configuration and manually move the carriages from the end stops to continue!", QMessageBox::Ok);
-        this->TerminatePrint();
     }
     do
     {
@@ -355,55 +413,57 @@ void GCodeInterpreter::HomeAllAxis()
 
 void GCodeInterpreter::MoveToolHead(const float &XPosition, const float &YPosition, const float &ZPosition, const float &ExtPosition)
 {
-    int stepx = 0, stepy = 0, stepz = 0, stepext = 0;
+    int stepX = 0, stepY = 0, stepZ = 0, stepEXT = 0;
     if(XPosition != 0)
-        stepx = qFloor((XPosition/_XRes) + 0.5) - _XAxis->Position; //this is how I round.
+        stepX = qFloor((XPosition/_XRes) + 0.5) - _XAxis->Position; //this is how I round.
     if(YPosition != 0)
-        stepy = qFloor((YPosition/_YRes) + 0.5) - _YAxis->Position;
+        stepY = qFloor((YPosition/_YRes) + 0.5) - _YAxis->Position;
     if(ZPosition != 0)
-        stepz = qFloor((ZPosition/_ZRes) + 0.5) - _ZAxis->Position;
+        stepZ = qFloor((ZPosition/_ZRes) + 0.5) - _ZAxis->Position;
     if(ExtPosition != 0)
-        stepext = qFloor((ExtPosition/_ExtRes) + 0.5) - _ExtAxis->Position;
+        stepEXT = qFloor((ExtPosition/_ExtRes) + 0.5) - _ExtAxis->Position;
 
-    float total_steps = qSqrt((qPow(stepx, 2) + qPow(stepy, 2)));
-    float total_3dsteps = total_steps * stepz;
+    float total_steps = qSqrt((qPow(stepX, 2) + qPow(stepY, 2)));
+    float total_3dsteps = 0;
+    if(total_steps > 0 && stepZ != 0)
+        total_3dsteps = qSqrt(qPow(total_steps, 2) + qPow(stepZ, 2));
     //_SpeedFactor = FCode / 60000 (1500 / 60000 = .025)
     //Resolution = Travel per Revolution / Steps per Revolution (14mm / 200 = .07)
     //MSDelay = 1 / (_SpeedFactor / Resolution) (1 / (.025 / .07) = 2.8)
     //2.8 MS delay between steps to meet F1500 Requirements
-    if(total_steps != 0 && total_3dsteps != 0 && stepext != 0)
+    if(total_steps != 0 && total_3dsteps != 0 && stepEXT != 0)
     {
-        _Controller->StepMotors(*_XAxis, stepx, *_YAxis, stepy, *_ZAxis, stepz, *_ExtAxis, stepext,
-                               (1 / (_SpeedFactor / qMin(_XRes, qMin(_ZRes, _YRes)))));
-        emit ProcessingMoves("Printing....");
+        emit ProcessingMoves("Printing 3D...");
+        _Controller->StepMotors(*_XAxis, stepX, *_YAxis, stepY, *_ZAxis, stepZ, *_ExtAxis, stepEXT,
+                                (1 / (_SpeedFactor / qMin(_XRes, qMin(_ZRes, _YRes)))));
     }
     else if(total_steps != 0 && total_3dsteps != 0)
     {
-        _Controller->StepMotors(*_XAxis, stepx, *_YAxis, stepy, *_ZAxis, stepz,
-                               (1 / (_SpeedFactor / qMin(_XRes, qMin(_ZRes, _YRes)))));
-        emit ProcessingMoves("Movind Tool Head 3D....");
+        emit ProcessingMoves("Moving Tool Head 3D...");
+        _Controller->StepMotors(*_XAxis, stepX, *_YAxis, stepY, *_ZAxis, stepZ,
+                                (1 / (_SpeedFactor / qMin(_XRes, qMin(_ZRes, _YRes)))));
     }
-    else if(total_steps != 0 && stepext != 0)
+    else if(total_steps != 0 && stepEXT != 0)
     {
-        _Controller->StepMotors(*_XAxis, stepx, *_YAxis, stepy, *_ExtAxis, stepext,
-                               (1 / (_SpeedFactor / qMin(_XRes, _YRes))));
-        emit ProcessingMoves("Printing....");
+        emit ProcessingMoves("Printing...");
+        _Controller->StepMotors(*_XAxis, stepX, *_YAxis, stepY, *_ExtAxis, stepEXT,
+                                (1 / (_SpeedFactor / qMin(_XRes, _YRes))));
     }
     else if(total_steps != 0)
     {
-        _Controller->StepMotors(*_XAxis, stepx, *_YAxis, stepy,
-                               (1 / (_SpeedFactor / qMin(_XRes, _YRes))));
-        emit ProcessingMoves("Moving Tool Head....");
+        emit ProcessingMoves("Moving...");
+        _Controller->StepMotors(*_XAxis, stepX, *_YAxis, stepY,
+                                (1 / (_SpeedFactor / qMin(_XRes, _YRes))));
     }
-    else if (stepz != 0)
+    else if (stepZ != 0)
     {
         emit ProcessingMoves("Moving Z Axis...");
-        _Controller->StepMotor(*_ZAxis, stepz, (1 / (_SpeedFactor / _ZRes)));
+        _Controller->StepMotor(*_ZAxis, stepZ, (1 / (_SpeedFactor / _ZRes)));
     }
-    else if (stepext != 0)
+    else if (stepEXT != 0)
     {
         emit ProcessingMoves("Moving Extruder...");
-        _Controller->StepMotor(*_ExtAxis, stepext,(1 / (_SpeedFactor / _ExtRes)));
+        _Controller->StepMotor(*_ExtAxis, stepEXT,(1 / (_SpeedFactor / _ExtRes)));
     }
 }
 void GCodeInterpreter::ExecuteArcMove(const float &XPosition, const float &YPosition, const float &ZPosition, const float &ExtPosition,
@@ -533,11 +593,15 @@ void GCodeInterpreter::ParseLine(QString &GString)
             return;
         for(int i = 0; i < GVals.length(); i++)
             if(GVals[i].contains("F") && !GVals[i].mid(1).isEmpty())
+            {
                 //Convert to units per millisecond
-                //F1500(mm/Min) = 25mm /Sec (1500 /60)
+                //F1500(mm/Min) = 25mm /Sec (1500 / 60)
                 //1500 / 60000 = .025
-                _SpeedFactor =  GVals[i].mid(1).toFloat() / 60000;
-        //TODO: Setup for speed multiplier from user input from UI.
+                _SpeedActual =  GVals[i].mid(1).toFloat() / 60000;
+                //Setup for speed multiplier from user input from UI.
+                _SpeedFactor = _SpeedActual *  _SpeedModulator;
+                //qDebug()<< "SPEED FACTOR" << QString::number(_SpeedFactor);
+            }
     }
 
     if(GString.startsWith("G"))
@@ -546,7 +610,6 @@ void GCodeInterpreter::ParseLine(QString &GString)
             return;
         if((GVals[0].mid(1) == "1" || GVals[0].mid(1) == "0"  || GVals[0].mid(1) == "01") && !GVals[0].mid(1).isEmpty())
         {
-            emit ProcessingMoves("Printing...");
             QList<Coordinate> Coords = GetCoordValues(GString);
             float XVal =0, YVal =0, ZVal =0, ExtVal =0;
             for(int i =0; i < Coords.length(); i++)
@@ -566,7 +629,6 @@ void GCodeInterpreter::ParseLine(QString &GString)
 
         else if (GVals[0].mid(1) == "2" || GVals[0].mid(1) == "3" || GVals[0].mid(1) == "02" || GVals[0].mid(1) == "03")
         {
-            emit ProcessingMoves("Printing...");
             QList<Coordinate> Coords = GetCoordValues(GString);
             float XVal =0, YVal =0, ZVal =0, ExtVal =0, IValue = 0, JValue = 0;
             for(int i =0; i < Coords.length(); i++)
@@ -1110,15 +1172,13 @@ void GCodeInterpreter::ExecutePrintSequence()
         emit ReportMotorPosition(QString::fromStdString(_YAxis->MotorName), _YAxis->Position );
         emit ReportMotorPosition(QString::fromStdString(_ZAxis->MotorName), _ZAxis->Position );
         emit ReportMotorPosition(QString::fromStdString(_ExtAxis->MotorName), _ExtAxis->Position );
+        ElapsedTime.setHMS(0,0,0);
+        ElapsedTime = ElapsedTime.addMSecs(StartTime.msecsTo(QDateTime::currentDateTime()));
+        emit ReportElapsedTime(ElapsedTime.toString());
     }
 
     if(!_TerminateThread)
-    {
-        _SpeedFactor = .15;
-        //Extend the bed so we can remove the part.
-        //MoveToolHead(1, _YArea - 50, 0, _ExtAxis->Position - 5);
         emit ReportProgress(100);
-    }
 }
 //======================================End Private Methods========================================
 
@@ -1127,11 +1187,10 @@ void GCodeInterpreter::BeginPrint()
 {
     if(!_IsPrinting)
     {
-       // connect(_Controller, SIGNAL(ReportMotorPosition(QString,long)), this, SLOT(UpdatePositionLabel(QString,long)));
         _IsPrinting = true;
         ExecutePrintSequence();
-        BedProbeWorker->Terminate();
-        ExtProbeWorker->Terminate();
+        BedProbeWorker->Stop();
+        ExtProbeWorker->Stop();
         BedProbeWorker->wait();
         ExtProbeWorker->wait();
         emit PrintComplete();
@@ -1149,10 +1208,14 @@ void GCodeInterpreter::PausePrint()
 void GCodeInterpreter::TerminatePrint()
 {
     this->_TerminateThread = true;
-    BedProbeWorker->Terminate();
-    ExtProbeWorker->Terminate();
+    BedProbeWorker->Stop();
+    ExtProbeWorker->Stop();
     BedProbeWorker->wait();
     ExtProbeWorker->wait();
+}
+
+void GCodeInterpreter::ChangeFanDuty(const int &DutyCycle)
+{
 }
 
 void GCodeInterpreter::ChangeBedTemp(const int &Celsius)
@@ -1168,6 +1231,13 @@ void GCodeInterpreter::ChangeExtTemp(const int &Celsius)
 void GCodeInterpreter::UpdatePositionLabel(QString Name, const long Pos)
 {
     emit ReportMotorPosition(Name, Pos);
+}
+
+void GCodeInterpreter::ModulateSpeed(const int &Factor)
+{
+    this->_SpeedModulator = (float)(Factor * .01);
+    this->_SpeedFactor = this->_SpeedActual *  this->_SpeedModulator;
+    //qDebug()<< "SPEED FACTOR" << QString::number(_SpeedFactor);
 }
 
 //=======================================END SLOTS=================================================
